@@ -1,0 +1,19 @@
+# Sensitive archives, headers, keys and backups
+*.luks
+*.luks-header
+*.luks-header.*
+*.vault
+*.img
+*.img.gz
+*.key
+*.keyfile
+*.recovery
+*passphrase*
+
+# Local test outputs
+.tmp/
+*.log
+*.swp
+*~
+__pycache__/
+.DS_Store
