@@ -1,0 +1,612 @@
+#!/usr/bin/env bash
+# devault v0.9: rootless, single-file LUKS2 + FIDO2 + Btrfs archives on Linux.
+# The archive is standard LUKS2/Btrfs; no sidecar metadata or privileged helper.
+set +xv  # Do not trace authentication material, even under bash -x.
+set -Eeuo pipefail
+export LC_ALL=C
+ulimit -c 0
+umask 077
+
+usage() {
+    cat >&2 <<'HELP'
+Usage:
+  devault create FILE [SIZE]    Create a sparse archive (default: 1G)
+  devault open FILE [--recovery] Unlock and mount (or explicitly use recovery)
+  devault close FILE            Unmount, lock, and release the loop device
+  devault status FILE           Show archive and mount state
+
+Run as an ordinary user. SIZE accepts bytes or K/M/G/T suffixes.
+Open creates name/ beside name.luks (otherwise FILE.mount/).
+Open prints that link's absolute path. Status also reports the link state.
+HELP
+    exit 2
+}
+fail() { printf 'devault: %s\n' "$*" >&2; exit 1; }
+info() { printf 'devault: %s\n' "$*" >&2; }
+need() { command -v "$1" >/dev/null || fail "missing command: $1"; }
+
+[[ $# -ge 2 ]] || usage
+action=$1
+case "$action" in
+    create) [[ $# -eq 2 || $# -eq 3 ]] || usage ;;
+    open) [[ $# -eq 2 || ( $# -eq 3 && $3 == --recovery ) ]] || usage ;;
+    close|status) [[ $# -eq 2 ]] || usage ;;
+    *) usage ;;
+esac
+(( EUID != 0 )) || fail 'run as an ordinary user, not root'
+
+# Canonicalize the parent directory without following a symlink at FILE itself.
+input=$2
+[[ ! -L $input ]] || fail 'archive must not be a symlink'
+parent=$(cd -- "$(dirname -- "$input")" && pwd -P) || fail 'archive directory not found'
+image=$parent/$(basename -- "$input")
+[[ -n ${image##*/} && $image != *$'\n'* ]] || fail 'invalid archive filename'
+link_name=${image##*/}
+link_name=${link_name%.[lL][uU][kK][sS]}
+if [[ -z $link_name || $link_name == . || $link_name == .. || $parent/$link_name == "$image" ]]; then
+    link_path=$image.mount
+else
+    link_path=$parent/$link_name
+fi
+
+force_recovery=0
+[[ $action != open || ${3:-} != --recovery ]] || force_recovery=1
+size=${3:-1G}
+if [[ $action == create ]]; then
+    [[ $size =~ ^[1-9][0-9]*[KMGT]?$ ]] || fail 'invalid SIZE (example: 1G or 32G)'
+else
+    [[ -f $image && ! -L $image && -O $image && -r $image ]] ||
+        fail 'archive must be an existing, user-owned regular file'
+fi
+
+need udisksctl
+need losetup
+need lsblk
+need findmnt
+need flock
+need jq
+need gdbus
+need readlink
+need ln
+need unlink
+
+# Secrets are passed through shell variables and pipes, never command arguments
+# or deliberate key files. Bash memory is not locked against swap. Temporary
+# files contain only credential IDs, salts and public metadata.
+tmp=''
+tty_state=''
+secret=''
+recovery=''
+recovery_confirmation=''
+loop=''
+dm=''
+owned_loop=0
+owned_unlock=0
+owned_mount=0
+created=0
+owned_link=0
+link_target=''
+automount_original=''
+automount_restore=0
+automount_lock_fd=''
+
+cleanup() {
+    local rc=$? can_release=1
+    trap - EXIT
+    set +e
+    if [[ -n $tty_state ]]; then
+        stty "$tty_state" </dev/tty 2>/dev/null
+    fi
+    if (( rc != 0 )); then
+        if (( owned_link )); then
+            remove_link "$link_target" || info "cleanup: could not remove link: $link_path"
+        fi
+        if (( owned_mount )) && [[ -n $dm ]]; then
+            if ! udisksctl unmount -b "$dm" --no-user-interaction >&2; then
+                info "cleanup: $dm remains mounted; use devault close after closing its files"
+                can_release=0
+            fi
+        fi
+        if (( owned_unlock )); then
+            if [[ -z $loop ]] || (( ! can_release )) ||
+               ! udisksctl lock -b "$loop" --no-user-interaction >&2; then
+                info 'cleanup: mapping left open; use devault status and devault close'
+                can_release=0
+            else
+                dm=''
+            fi
+        fi
+        if (( owned_loop && can_release )) && [[ -n $loop && -z $dm ]]; then
+            release_loop >&2 || info "cleanup: loop remains attached: $loop"
+        fi
+        if (( created )); then
+            info "creation did not finish; incomplete archive retained: $image"
+        fi
+    fi
+    secret=''
+    recovery=''
+    recovery_confirmation=''
+    if [[ -n $tmp ]]; then rm -rf -- "$tmp"; fi
+    if ! restore_automount; then
+        info "could not restore GNOME automount; restore with: gsettings set org.gnome.desktop.media-handling automount $automount_original"
+        (( rc != 0 )) || rc=1
+    fi
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+# GNOME reacts independently to newly attached block devices. Suppress its
+# automount attempts for this operation, then restore the user's saved value.
+# Serialize across archives because this setting belongs to the whole session.
+pause_automount() {
+    local runtime=${XDG_RUNTIME_DIR:-} current
+    command -v gsettings >/dev/null || return 0
+    current=$(gsettings get org.gnome.desktop.media-handling automount 2>/dev/null) || return 0
+    [[ $current == true || $current == false ]] || fail 'unexpected GNOME automount setting'
+    [[ -n $runtime && -d $runtime && -O $runtime && -w $runtime ]] ||
+        fail 'XDG_RUNTIME_DIR is required to coordinate GNOME automount suppression'
+    exec {automount_lock_fd}>"$runtime/devault-automount.lock"
+    flock -x -n "$automount_lock_fd" || fail 'another devault is temporarily managing GNOME automount'
+    # Read again under the lock: another invocation may just have restored it.
+    automount_original=$(gsettings get org.gnome.desktop.media-handling automount) ||
+        fail 'cannot read GNOME automount setting'
+    [[ $automount_original == true || $automount_original == false ]] ||
+        fail 'unexpected GNOME automount setting'
+    if [[ $automount_original == true ]]; then
+        automount_restore=1
+        gsettings set org.gnome.desktop.media-handling automount false ||
+            fail 'cannot disable GNOME automount'
+        current=$(gsettings get org.gnome.desktop.media-handling automount) ||
+            fail 'cannot verify GNOME automount setting'
+        [[ $current == false ]] || fail 'GNOME automount did not become disabled'
+    fi
+}
+
+restore_automount() {
+    local current
+    if (( automount_restore )); then
+        gsettings set org.gnome.desktop.media-handling automount "$automount_original" || return 1
+        current=$(gsettings get org.gnome.desktop.media-handling automount) || return 1
+        [[ $current == "$automount_original" ]] || return 1
+        automount_restore=0
+    fi
+    if [[ -n $automount_lock_fd ]]; then
+        exec {automount_lock_fd}>&-
+        automount_lock_fd=''
+    fi
+}
+
+# No persistent link registry: only reuse/remove a link whose literal target
+# matches the mount we observed. Unknown links (even dangling ones) stay intact.
+ensure_link() {
+    local target
+    if [[ -L $link_path ]]; then
+        target=$(readlink -- "$link_path") || fail 'cannot inspect existing symlink'
+        [[ $target == "$mountpoint" ]] ||
+            fail "link path already points elsewhere: $link_path -> $target (left unchanged)"
+    elif [[ -e $link_path ]]; then
+        fail "link path already exists: $link_path (left unchanged)"
+    else
+        link_target=$mountpoint
+        ln -sT -- "$mountpoint" "$link_path" || fail "cannot create link: $link_path"
+        owned_link=1
+    fi
+}
+
+remove_link() {
+    local expected=$1 target
+    [[ -n $expected && -L $link_path ]] || return 0
+    target=$(readlink -- "$link_path") || return 1
+    [[ $target == "$expected" ]] || return 0
+    unlink -- "$link_path"
+}
+
+link_status() {
+    local mounted=${1:-} target
+    if [[ -L $link_path ]]; then
+        target=$(readlink -- "$link_path") || fail 'cannot inspect symlink'
+        if [[ -n $mounted && $target == "$mounted" ]]; then
+            printf 'link: %s -> %s\n' "$link_path" "$target"
+        elif [[ ! -e $link_path ]]; then
+            printf 'link dangling: %s -> %s\n' "$link_path" "$target"
+        else
+            printf 'link differs from current mount: %s -> %s\n' "$link_path" "$target"
+        fi
+    elif [[ -e $link_path ]]; then
+        printf 'link path occupied: %s\n' "$link_path"
+    else
+        printf 'link absent: %s\n' "$link_path"
+    fi
+}
+
+# Serialize devault operations without an external lock file.
+# Lock the parent directory, leaving the image free for cryptsetup's own
+# native LUKS2 metadata locking. This serializes all devault archives in that directory.
+lock_archive() {
+    exec {lock_fd}<"$parent" || fail 'cannot lock archive directory'
+    flock -x -n "$lock_fd" || fail 'another devault operation is in progress in this directory'
+}
+
+# Return a loop device associated with the exact backing file, if one exists.
+find_loop() {
+    local found
+    found=$(losetup -j "$image" -n -O NAME) || fail 'cannot inspect loop devices'
+    [[ $found != *$'\n'* ]] || fail 'multiple loop devices use this archive'
+    loop=$found
+}
+
+# The crypt device-mapper child, if one exists, is found by kernel name.
+find_mapping() {
+    local found
+    dm=''
+    [[ -n $loop ]] || return 0
+    found=$(lsblk -nr -o KNAME,TYPE "$loop" |
+        awk '$2 == "crypt" { print "/dev/" $1 }') || fail 'cannot inspect LUKS mapping'
+    [[ $found != *$'\n'* ]] || fail 'multiple encrypted mappings found'
+    dm=$found
+}
+
+# JSON decodes spaces/backslashes in mount paths without shell escape parsing.
+# Refuse multiple mount targets rather than unmounting an arbitrary one.
+mount_location() {
+    local result rc=0
+    [[ -n $dm ]] || return 0
+    result=$(findmnt --json --list --source "$dm" --output TARGET) || rc=$?
+    if (( rc == 1 )) && [[ -z $result ]]; then return 0; fi
+    (( rc == 0 )) || fail 'cannot inspect mounts'
+    jq -er '[.filesystems[]?.target] | unique |
+        if length == 0 then ""
+        elif length == 1 then .[0]
+        else error("multiple mount targets; unmount extra mounts first") end' <<<"$result"
+}
+
+# Require exactly one plugged-in security key for the initial release.
+# An absent/ambiguous key during OPEN falls back to the recovery passphrase.
+find_fido_device() {
+    local listing
+    local -a devices=()
+    device=''
+    command -v fido2-token >/dev/null || return 1
+    listing=$(fido2-token -L) || return 1
+    mapfile -t devices < <(sed -n 's#^\(/dev/hidraw[0-9][0-9]*\):.*#\1#p' <<<"$listing")
+    (( ${#devices[@]} == 1 )) || return 1
+    device=${devices[0]}
+    [[ -r $device && -w $device ]]
+}
+
+prepare_temp() {
+    local base=${XDG_RUNTIME_DIR:-/tmp}
+    [[ -d $base && -w $base ]] || base=/tmp
+    tmp=$(mktemp -d "$base/devault.XXXXXXXX")
+}
+
+# Produce the Base64 HMAC-secret that serves as the LUKS keyslot passphrase.
+# The JSON follows the same systemd-fido2 token format as systemd-cryptenroll.
+derive_secret() {
+    local token=$1 pin up uv assertion challenge
+    local -a lines=()
+    secret=''
+    # Strictly validate fields before turning untrusted header JSON into lines.
+    jq -e '( ."fido2-credential" | type == "string" and
+                test("^[A-Za-z0-9+/]+={0,2}$") ) and
+           ( ."fido2-salt" | type == "string" and
+                test("^[A-Za-z0-9+/]{43}=$") ) and
+           ( ."fido2-rp" == "io.systemd.cryptsetup" )' \
+        <<<"$token" >/dev/null || return 1
+    pin=$(jq -r '."fido2-clientPin-required"' <<<"$token") || return 1
+    up=$(jq -r '."fido2-up-required"' <<<"$token") || return 1
+    uv=$(jq -r '."fido2-uv-required"' <<<"$token") || return 1
+    [[ $pin =~ ^(true|false)$ && $up =~ ^(true|false)$ && $uv =~ ^(true|false)$ ]] || return 1
+    challenge=$(head -c 32 /dev/urandom | base64 -w0) || return 1
+    jq -r --arg challenge "$challenge" '$challenge,
+           ."fido2-rp", ."fido2-credential", ."fido2-salt"' \
+        <<<"$token" > "$tmp/assert.params" || return 1
+
+    tty_state=$(stty -g </dev/tty) || return 1
+    stty -echo </dev/tty || return 1
+    if assertion=$(fido2-assert -G -h \
+        -t "up=$up" -t "pin=$pin" -t "uv=$uv" \
+        -i "$tmp/assert.params" "$device"); then
+        stty "$tty_state" </dev/tty || return 1
+        tty_state=''
+        # Nonresident assertion with hmac-secret: exactly five output lines.
+        mapfile -t lines <<<"$assertion"
+        assertion=''
+        (( ${#lines[@]} == 5 )) || return 1
+        [[ ${lines[0]} == "$challenge" && ${lines[1]} == io.systemd.cryptsetup &&
+           ${lines[4]} =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 1
+        secret=${lines[4]}
+    else
+        stty "$tty_state" </dev/tty || return 1
+        tty_state=''
+        return 1
+    fi
+}
+
+# Discover state after successful operations; never parse translated prose.
+setup_loop() {
+    pause_automount
+    udisksctl loop-setup --file "$image" --no-user-interaction >&2 || fail 'loop setup failed'
+    owned_loop=1
+    find_loop
+    [[ -n $loop ]] || fail 'loop setup returned success but no loop was found'
+}
+
+# Once the unlocked mapping is mounted, ask the kernel to release our loop
+# automatically when its last user (the LUKS mapping) disappears.
+# Never invoke Polkit's administrator authentication dialog.
+enable_autoclear() {
+    local object=/org/freedesktop/UDisks2/block_devices/${loop##*/}
+    gdbus call --system --timeout 300 --dest org.freedesktop.UDisks2 \
+        --object-path "$object" \
+        --method org.freedesktop.UDisks2.Loop.SetAutoclear \
+        true "{'auth.no_user_interaction': <true>}" >/dev/null 2>&1 ||
+        info "automatic loop release unavailable; will attempt ordinary-user deletion"
+}
+
+# Release only this archive's own loop, and NEVER trigger an administrator
+# prompt if UDisks2 has forgotten the originating UID.
+release_loop() {
+    local current
+    [[ -n $loop ]] || return 0
+    current=$(losetup -j "$image" -n -O NAME) || return 1
+    [[ -z $current ]] && return 0  # kernel autoclear already released it
+    [[ $current == "$loop" ]] || return 1
+    if ! udisksctl loop-delete -b "$loop" --no-user-interaction >&2; then
+        # Autoclear can finish between the inspection and Delete call.
+        current=$(losetup -j "$image" -n -O NAME) || return 1
+        [[ -z $current ]] || return 1
+    fi
+    current=$(losetup -j "$image" -n -O NAME) || return 1
+    [[ -z $current ]]
+}
+
+unlock_fido() {
+    printf '%s' "$secret" | udisksctl unlock -b "$loop" \
+        --key-file /dev/stdin --no-user-interaction >&2 || return 1
+    owned_unlock=1
+    find_mapping
+    [[ -n $dm ]] || fail 'unlock returned success but no mapping was found'
+}
+
+unlock_passphrase() {
+    info 'Enter your recovery passphrase.'
+    printf 'Recovery passphrase: ' >&2
+    IFS= read -rs recovery </dev/tty || fail 'could not read recovery passphrase'
+    printf '\n' >&2
+    [[ -n $recovery ]] || fail 'recovery passphrase cannot be empty'
+    printf '%s' "$recovery" | udisksctl unlock -b "$loop" \
+        --key-file /dev/stdin --no-user-interaction >&2 || fail 'passphrase unlock failed'
+    recovery=''
+    owned_unlock=1
+    find_mapping
+    [[ -n $dm ]] || fail 'unlock returned success but no mapping was found'
+}
+
+mount_btrfs() {
+    local result mounted
+    mounted=$(mount_location)
+    if [[ -n $mounted ]]; then
+        mountpoint=$mounted
+        return 0
+    fi
+    if result=$(udisksctl mount -b "$dm" --options compress=zstd --no-user-interaction 2>&1); then
+        owned_mount=1
+        mountpoint=$(mount_location)
+        [[ -n $mountpoint ]] || fail 'mount returned success but no mount was found'
+    else
+        # GNOME can win the race between checking and mounting.
+        mounted=$(mount_location)
+        [[ -n $mounted ]] || fail "mount failed: $result"
+        mountpoint=$mounted
+    fi
+}
+
+case "$action" in
+    create)
+        need cryptsetup; need jq; need fido2-token; need fido2-cred
+        need fido2-assert; need btrfs; need stty; need numfmt
+        need truncate; need base64; need head; need mktemp
+        # Name the filesystem after the archive, without a .luks suffix.
+        label=${image##*/}
+        label=${label%.[lL][uU][kK][sS]}
+        [[ -n $label ]] || label=${image##*/}
+        (( ${#label} < 256 )) || fail 'filesystem label must be less than 256 bytes'
+        # JSON string quoting also protects the GVariant string argument.
+        label_variant=$(jq -cn --arg label "$label" '$label')
+        lock_archive
+        [[ ! -e $image && ! -L $image ]] || fail 'archive already exists (refusing to overwrite)'
+        stty -g </dev/tty >/dev/null || fail 'create requires a controlling terminal'
+        bytes=$(numfmt --from=iec -- "$size") || fail 'invalid archive size'
+        (( bytes >= 134217728 )) || fail 'Btrfs archive must be at least 128M'
+        find_fido_device || fail 'connect exactly one accessible FIDO2 security key'
+        ( set -C; : > "$image" ) || fail 'cannot create archive'
+        created=1
+        truncate -s "$bytes" -- "$image"
+        prepare_temp
+
+        info "Registering FIDO2 security key $device ..."
+        challenge=$(head -c 32 /dev/urandom | base64 -w0)
+        user_id=$(head -c 32 /dev/urandom | base64 -w0)
+        printf '%s\n' "$challenge" \
+            'io.systemd.cryptsetup' 'devault' \
+            "$user_id" > "$tmp/cred.params"
+        tty_state=$(stty -g </dev/tty)
+        stty -echo </dev/tty
+        fido2-cred -M -h -t pin=true -i "$tmp/cred.params" \
+            -o "$tmp/cred" "$device"
+        stty "$tty_state" </dev/tty
+        tty_state=''
+        fido2-cred -V -h -i "$tmp/cred" -o "$tmp/verified"
+        credential=$(head -n 1 "$tmp/verified")
+        [[ -n $credential ]] || fail 'FIDO2 credential ID was empty'
+        salt=$(head -c 32 /dev/urandom | base64 -w0)
+        jq -n --arg cred "$credential" --arg salt "$salt" '{
+          type: "systemd-fido2", keyslots: ["1"],
+          "fido2-credential": $cred, "fido2-salt": $salt,
+          "fido2-rp": "io.systemd.cryptsetup",
+          "fido2-clientPin-required": true,
+          "fido2-up-required": true,
+          "fido2-uv-required": false
+        }' > "$tmp/token.json"
+        derive_secret "$(cat "$tmp/token.json")" || fail 'FIDO2 assertion failed'
+
+        # Keep the recovery passphrase independent of FIDO2 enrollment.
+        # Verify both keyslots before any device-mapper operation.
+        info 'Choose and confirm a recovery passphrase.'
+        printf 'Recovery passphrase: ' >&2
+        IFS= read -rs recovery </dev/tty || fail 'could not read recovery passphrase'
+        printf '\n' >&2
+        [[ -n $recovery ]] || fail 'recovery passphrase cannot be empty'
+        printf 'Verify recovery passphrase: ' >&2
+        IFS= read -rs recovery_confirmation </dev/tty || fail 'could not verify recovery passphrase'
+        printf '\n' >&2
+        [[ $recovery == "$recovery_confirmation" ]] || fail 'recovery passphrases do not match'
+        recovery_confirmation=''
+
+        info 'Initializing LUKS2 with the recovery passphrase ...'
+        printf '%s' "$recovery" | cryptsetup luksFormat \
+            --batch-mode --type luks2 --key-file - "$image"
+        printf '%s' "$recovery" | cryptsetup open \
+            --test-passphrase --type luks2 --key-slot 0 --key-file - "$image" ||
+            fail 'recovery keyslot verification failed'
+
+        info 'Enrolling hardware-derived secret in LUKS2 keyslot 1 ...'
+        # Supply the already-verified existing passphrase on stdin, as when
+        # luksFormat succeeded. The new FIDO2 key uses its own descriptor.
+        printf '%s' "$recovery" | cryptsetup luksAddKey \
+            --new-key-slot 1 --key-file - \
+            --new-keyfile <(printf '%s' "$secret") "$image"
+        printf '%s' "$secret" | cryptsetup open \
+            --test-passphrase --type luks2 --key-slot 1 --key-file - "$image" ||
+            fail 'FIDO2 keyslot verification failed (recovery passphrase remains usable)'
+        cryptsetup token import --json-file "$tmp/token.json" "$image"
+        recovery=''
+
+        setup_loop
+        unlock_fido || fail 'FIDO2 unlock failed after enrollment'
+        # D-Bus object paths encode hyphens as _2d (dm-3 -> dm_2d3).
+        object=/org/freedesktop/UDisks2/block_devices/${dm##*/}
+        object=${object//-/_2d}
+        info 'Formatting unlocked mapping as Btrfs ...'
+        gdbus call --system --timeout 300 --dest org.freedesktop.UDisks2 \
+            --object-path "$object" --method org.freedesktop.UDisks2.Block.Format \
+            btrfs "{'label': <$label_variant>, 'take-ownership': <true>, 'auth.no_user_interaction': <true>}" >/dev/null
+        mount_btrfs
+        # Persist directory compression for mounts later performed by GNOME.
+        btrfs property set -t inode "$mountpoint" compression zstd
+        # Btrfs and both LUKS2 keyslots are now initialized successfully.
+        enable_autoclear
+        udisksctl unmount -b "$dm" --no-user-interaction >&2
+        owned_mount=0
+        udisksctl lock -b "$loop" --no-user-interaction >&2
+        owned_unlock=0
+        created=0
+        secret=''
+        if release_loop; then
+            owned_loop=0
+        else
+            # This is a cleanup problem, not a failed archive creation.
+            owned_loop=0
+            info "warning: $loop remains attached; UDisks2 did not permit rootless deletion"
+        fi
+        info "Created $image ($size logical, sparse backing file)"
+        ;;
+    open)
+        need cryptsetup; need stty
+        [[ -w $image ]] || fail 'archive is not writable'
+        lock_archive
+        cryptsetup isLuks --type luks2 "$image" || fail 'not a LUKS2 archive'
+        find_loop
+        if [[ -z $loop ]]; then setup_loop; else pause_automount; fi
+        find_mapping
+        if [[ -z $dm ]]; then
+            # A missing key or unavailable fido2-tools must not prevent recovery.
+            if (( ! force_recovery )) && command -v fido2-assert >/dev/null &&
+               command -v base64 >/dev/null && command -v head >/dev/null &&
+               find_fido_device && stty -g </dev/tty >/dev/null 2>&1; then
+                prepare_temp
+                token=$(cryptsetup luksDump --dump-json-metadata "$image" |
+                    jq -ce '[ (.tokens // {})[] | select(.type == "systemd-fido2") ] |
+                        if length == 0 then empty else .[0] end') || token=''
+                if [[ -n $token ]]; then
+                    info "Unlocking via FIDO2 $device ..."
+                    if derive_secret "$token" && unlock_fido; then
+                        info 'FIDO2 unlock successful.'
+                    else
+                        info 'FIDO2 unlock unavailable; falling back to recovery passphrase.'
+                    fi
+                fi
+            fi
+            if [[ -z $dm ]]; then
+                stty -g </dev/tty >/dev/null || fail 'recovery requires a controlling terminal'
+                unlock_passphrase
+            fi
+        fi
+        mounted=$(mount_location)
+        if [[ -n $mounted ]]; then
+            mountpoint=$mounted
+        else
+            mount_btrfs
+        fi
+        secret=''
+        enable_autoclear
+        ensure_link
+        printf '%s\n' "$link_path"
+        # A successful open deliberately leaves the mapping and mount alive.
+        owned_loop=0
+        owned_unlock=0
+        owned_mount=0
+        owned_link=0
+        ;;
+    close)
+        [[ -w $image ]] || fail 'archive is not writable'
+        link_cleanup_failed=0
+        lock_archive
+        find_loop
+        if [[ -z $loop ]]; then
+            info 'Already closed.'
+            link_status >&2
+            exit 0
+        fi
+        find_mapping
+        if [[ -n $dm ]]; then
+            mounted=$(mount_location)
+            if [[ -n $mounted ]]; then
+                link_target=$mounted
+                udisksctl unmount -b "$dm" --no-user-interaction >&2 || fail 'filesystem is busy; close open files first'
+                mounted=$(mount_location)
+                [[ -z $mounted ]] || fail 'filesystem remains mounted'
+                remove_link "$link_target" || link_cleanup_failed=1
+            fi
+            udisksctl lock -b "$loop" --no-user-interaction >&2 || fail 'could not lock LUKS2'
+        fi
+        release_loop || fail "LUKS locked, but could not release $loop without administrator authentication"
+        (( ! link_cleanup_failed )) || fail "closed, but could not remove link: $link_path"
+        info "Closed $image"
+        ;;
+    status)
+        find_loop
+        if [[ -z $loop ]]; then
+            printf 'closed: %s\n' "$image"
+            link_status
+            exit 0
+        fi
+        find_mapping
+        if [[ -z $dm ]]; then
+            printf 'attached, locked: %s\n' "$loop"
+            link_status
+            exit 0
+        fi
+        mounted=$(mount_location)
+        if [[ -z $mounted ]]; then
+            printf 'unlocked, unmounted: %s (%s)\n' "$loop" "$dm"
+        else
+            printf 'mounted: %s (%s -> %s)\n' "$mounted" "$loop" "$dm"
+        fi
+        link_status "$mounted"
+        ;;
+esac
